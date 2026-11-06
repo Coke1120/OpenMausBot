@@ -733,6 +733,7 @@ export type Action =
   | { type: "threadActive"; threadId: string; activeLeafId: string }
   | { type: "loadOlderMessages"; threadId: string }
   | { type: "olderMessages"; threadId: string; generation: number; messages: Message[]; hasMore: boolean }
+  | { type: "threadTail"; threadId: string; generation: number; messages: Message[]; hasMore: boolean; activeLeafId: string | null }
   | { type: "answerCard"; botId: string; messageId: string; answer: string; threadId?: string; groupId?: string }
   | { type: "answerCardFailed"; botId: string; messageId: string; answer: string; groupId?: string }
   | { type: "dismissCard"; botId: string; messageId: string; threadId?: string; groupId?: string }
@@ -962,6 +963,38 @@ export function reducer(state: AppState, action: Action): AppState {
         bots: state.bots.map((bot) => (bot.threadId === action.threadId ? prepend(bot) : bot)),
         groups: state.groups.map((group) => (group.threadId === action.threadId ? prepend(group) : group)),
       };
+    }
+    case "threadTail": {
+      if ((state.transcriptGeneration[action.threadId] ?? 0) !== action.generation) return state;
+      const pageIds = new Set(action.messages.map((message) => message.id));
+      const pageSendIds = new Set(action.messages.flatMap((message) => (message.sendId ? [message.sendId] : [])));
+      const oldest = action.messages[0]?.at;
+      const merge = (messages: Message[]): { messages: Message[]; hasMore: boolean } | null => {
+        const kept = messages.filter((message) => !pageIds.has(message.id) && !(message.sendId && pageSendIds.has(message.sendId) && message.id === optimisticMessageId(message.sendId)));
+        if (kept.some((message) => oldest !== undefined && message.at < oldest && !message.id.startsWith("optimistic-"))) return null;
+        return { messages: [...action.messages, ...kept], hasMore: action.hasMore };
+      };
+      let changed = false;
+      const bots = state.bots.map((bot) => {
+        if (bot.threadId !== action.threadId) return bot;
+        const merged = merge(bot.messages ?? []);
+        if (!merged) return bot;
+        changed = true;
+        return {
+          ...bot,
+          messages: merged.messages,
+          hasMore: merged.hasMore,
+          activeLeafId: (bot.messages?.length ?? 0) === 0 ? (action.activeLeafId ?? bot.activeLeafId) : bot.activeLeafId,
+        };
+      });
+      const groups = state.groups.map((group) => {
+        if (group.threadId !== action.threadId) return group;
+        const merged = merge(group.messages ?? []);
+        if (!merged) return group;
+        changed = true;
+        return { ...group, messages: merged.messages, hasMore: merged.hasMore };
+      });
+      return changed ? { ...state, bots, groups } : state;
     }
     case "sectionDeleted":
       return {
@@ -1919,8 +1952,53 @@ export const initialState: AppState = {
 
 export { api, ApiError, liveCallFromFrame, nextLiveCallLookup };
 
-/** Messages per snapshot thread and per scrollback page: the server's own page maximum. */
+/** Messages per open thread and per scrollback page: the server's own page maximum. The roster itself asks for none. */
 export const MESSAGE_PAGE_SIZE = 200;
+const ROSTER_PATH = "/api/bots?messages=0";
+
+function withoutTranscript<T extends { messages?: Message[]; hasMore?: boolean }>(bot: T): Omit<T, "messages" | "hasMore"> {
+  const { messages: _messages, hasMore: _hasMore, ...settings } = bot;
+  return settings;
+}
+
+function snapshotSelection(
+  selectedId: string,
+  bots: ReadonlyArray<{ id: string; hidden?: boolean }>,
+  groups: ReadonlyArray<{ id: string }>,
+  resumeId: string | undefined,
+): string {
+  const known = (id: string) => bots.some((bot) => bot.id === id) || groups.some((group) => group.id === id);
+  const resumed = resumeId && (bots.some((bot) => bot.id === resumeId && !bot.hidden) || groups.some((group) => group.id === resumeId)) ? resumeId : "";
+  return selectedId && known(selectedId) ? selectedId : resumed || (bots[0]?.id ?? "");
+}
+
+function openTranscriptRequest(state: AppState, threadsShown: boolean): { threadId: string; generation: number } | null {
+  if (!state.hydrated || !state.selectedId) return null;
+  const group = state.groups.find((candidate) => candidate.id === state.selectedId);
+  const bot = group ? undefined : state.bots.find((candidate) => candidate.id === state.selectedId);
+  const owner = group ?? bot;
+  if (!owner || (owner.messages?.length ?? 0) > 0 || !owner.hasMore || bot?.switchingTo) return null;
+  if (bot && botOpensTo(bot, threadsShown) !== bot.threadId) return null;
+  return { threadId: owner.threadId, generation: state.transcriptGeneration[owner.threadId] ?? 0 };
+}
+
+async function attachOpenThread(bots: Bot[], groups: Group[], threadsShown: boolean, selectedId: string): Promise<void> {
+  const group = groups.find((candidate) => candidate.id === selectedId);
+  const bot = group ? undefined : bots.find((candidate) => candidate.id === selectedId);
+  const owner = group ?? bot;
+  if (!owner || (owner.messages?.length ?? 0) > 0 || !owner.hasMore || bot?.switchingTo) return;
+  if (bot && botOpensTo(bot, threadsShown) !== bot.threadId) return;
+  try {
+    const page = await api<{ messages?: Message[]; hasMore?: boolean; activeLeafId?: string | null }>(
+      `/api/threads/${owner.threadId}/messages?limit=${MESSAGE_PAGE_SIZE}`,
+    );
+    owner.messages = page.messages ?? [];
+    owner.hasMore = Boolean(page.hasMore);
+    if (bot && page.activeLeafId) bot.activeLeafId = page.activeLeafId;
+  } catch {
+    // The open-thread effect loads the tail while it is still empty.
+  }
+}
 
 
 type TrustedApprovalBridge = {
@@ -2130,8 +2208,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         send: (botId, patch, signal, currentBot, leaving) =>
           persistBotUpdate(botId, patch, signal, api, desktopApprovalBridge(), currentBot, leaving),
         reconcile: async (botId, signal) => {
-          const result: { bots: BotAnnouncement[] } = await api(`/api/bots?messages=${MESSAGE_PAGE_SIZE}`, { signal });
-          return result.bots.find((candidate) => candidate.id === botId) ?? null;
+          const result: { bots: BotAnnouncement[] } = await api(ROSTER_PATH, { signal });
+          const found = result.bots.find((candidate) => candidate.id === botId);
+          return found ? withoutTranscript(found) : null;
         },
         onAuthoritative: (bot, optimisticOverlay) => {
           rawDispatch({ type: "botPatched", bot: withTaskWrites({ ...bot, ...optimisticOverlay }) });
@@ -2226,10 +2305,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         // Keep blocking sends while reconciliation fails (it is asked again) or a newer write owns this lane.
         if (taskWrites.get(threadId) === pending) {
           pending.patch = {};
-          retryRequest(() => taskWrites.get(threadId) === pending, () => api(`/api/bots?messages=${MESSAGE_PAGE_SIZE}`).then(({ bots }) => {
-            const bot = taskWrites.get(threadId) === pending ? bots.find((candidate: Bot) => candidate.id === botId) : undefined;
+          retryRequest(() => taskWrites.get(threadId) === pending, () => api<{ bots: Bot[] }>(ROSTER_PATH).then(({ bots }) => {
+            const bot = taskWrites.get(threadId) === pending ? bots.find((candidate) => candidate.id === botId) : undefined;
             if (bot) {
-              rawDispatch({ type: "botPatched", bot: withTaskWrites(bot) });
+              rawDispatch({ type: "botPatched", bot: withTaskWrites(withoutTranscript(bot)) });
               taskWrites.delete(threadId);
             }
           }));
@@ -2930,6 +3009,38 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     if (bot && state.activeView === "chat" && botOpensTo(bot, showThreads) !== bot.threadId) openBot(dispatch, bot, showThreads);
   }, [state.hydrated, state.bots, state.selectedId, state.activeView, showThreads, dispatch]);
 
+  const tailToken = useRef(0);
+  const tailMounted = useRef(true);
+  useEffect(() => {
+    tailMounted.current = true;
+    return () => { tailMounted.current = false; };
+  }, []);
+  const openTail = openTranscriptRequest(state, showThreads);
+  const openTailThread = openTail?.threadId ?? "";
+  const openTailGeneration = openTail?.generation ?? 0;
+  useEffect(() => {
+    if (!openTailThread) return;
+    const token = ++tailToken.current;
+    const threadId = openTailThread;
+    const generation = openTailGeneration;
+    void api<{ messages?: Message[]; hasMore?: boolean; activeLeafId?: string | null }>(
+      `/api/threads/${threadId}/messages?limit=${MESSAGE_PAGE_SIZE}`,
+    ).then((page) => {
+      if (!tailMounted.current || tailToken.current !== token) return;
+      rawDispatch({
+        type: "threadTail",
+        threadId,
+        generation,
+        messages: page.messages ?? [],
+        hasMore: Boolean(page.hasMore),
+        activeLeafId: page.activeLeafId ?? null,
+      });
+    }).catch((error: unknown) => {
+      if (!tailMounted.current || tailToken.current !== token) return;
+      rawDispatch({ type: "error", message: error instanceof Error ? error.message : String(error) });
+    });
+  }, [openTailThread, openTailGeneration]);
+
   useEffect(() => {
     let alive = true;
     type PeripheralKey = "instances" | "config" | "routines" | "webhooks" | "notifications";
@@ -3048,22 +3159,30 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           if (alive && answer) flushSync(() => rawDispatch({ type: "liveCallLookup", call: answer.call, since, seq }));
         })
         .catch(() => {});
-      const chat = () =>
-        api(`/api/bots?messages=${MESSAGE_PAGE_SIZE}`).then((answer) => snapshotArrays(answer, "bots")).then(({ bots, groups, sections, computerControl, botQueuedMessages }) => {
-          if (!alive) return;
-          rawDispatch({
-            type: "hydrate",
-            bots,
-            groups: groups ?? [],
-            sections: sections ?? [],
-            computerControl: computerControl ?? {},
-            botQueuedMessages,
-            preserveNavigation: selectionRevision.current !== navigationAtStart,
-            navigationSince,
-            taskIdsAtStart,
-            resumeId: readLastConversation() ?? undefined,
-          });
+      const chat = async () => {
+        const answer = await api(ROSTER_PATH);
+        const { bots, groups = [], sections, computerControl, botQueuedMessages } = snapshotArrays(answer, "bots");
+        const resumeId = readLastConversation() ?? undefined;
+        await attachOpenThread(
+          bots,
+          groups,
+          showThreadsRef.current,
+          snapshotSelection(stateRef.current.selectedId, bots, groups, resumeId),
+        );
+        if (!alive) return;
+        rawDispatch({
+          type: "hydrate",
+          bots,
+          groups,
+          sections: sections ?? [],
+          computerControl: computerControl ?? {},
+          botQueuedMessages,
+          preserveNavigation: selectionRevision.current !== navigationAtStart,
+          navigationSince,
+          taskIdsAtStart,
+            resumeId,
         });
+      };
       const peripherals = peripheralParts.map((part) => ({
         key: part.key,
         load: () => loadPeripheral(part, false),
