@@ -26,6 +26,8 @@ import { optimisticMessageId, optimisticUserMessage, sendArrived, sendReconciled
 import { patchedGroups, roomAnswers, snapshotPatch } from "./room-frames";
 import { savedStateAction, type SavedOwner, type SavedSnapshot } from "./saved-state";
 import { keepBotNavigation, keepGroupNavigation, navigatedSince, visibleMessages } from "./snapshot-navigation";
+import { applyThreadTail, MESSAGE_PAGE_SIZE, prepareRoster, ROSTER_PATH, useOpenThreadTail, withoutTranscript } from "./roster-transcript";
+export { MESSAGE_PAGE_SIZE };
 export { visibleMessages } from "./snapshot-navigation";
 export { awayFromMainThread, botOpensTo, markedThread, openBot, openBotRow, openBotThread, openRoomThread, openThread, visibleNotificationThread, type ThreadTarget } from "./thread-navigation";
 import type { TurnDigest } from "../../shared/digest";
@@ -733,6 +735,7 @@ export type Action =
   | { type: "threadActive"; threadId: string; activeLeafId: string }
   | { type: "loadOlderMessages"; threadId: string }
   | { type: "olderMessages"; threadId: string; generation: number; messages: Message[]; hasMore: boolean }
+  | { type: "threadTail"; threadId: string; generation: number; messages: Message[]; hasMore: boolean; activeLeafId: string | null }
   | { type: "answerCard"; botId: string; messageId: string; answer: string; threadId?: string; groupId?: string }
   | { type: "answerCardFailed"; botId: string; messageId: string; answer: string; groupId?: string }
   | { type: "dismissCard"; botId: string; messageId: string; threadId?: string; groupId?: string }
@@ -963,6 +966,7 @@ export function reducer(state: AppState, action: Action): AppState {
         groups: state.groups.map((group) => (group.threadId === action.threadId ? prepend(group) : group)),
       };
     }
+    case "threadTail": return applyThreadTail(state, action);
     case "sectionDeleted":
       return {
         ...state, sections: action.sections,
@@ -1919,10 +1923,6 @@ export const initialState: AppState = {
 
 export { api, ApiError, liveCallFromFrame, nextLiveCallLookup };
 
-/** Messages per snapshot thread and per scrollback page: the server's own page maximum. */
-export const MESSAGE_PAGE_SIZE = 200;
-
-
 type TrustedApprovalBridge = {
   setMode(
     botId: string,
@@ -2130,8 +2130,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         send: (botId, patch, signal, currentBot, leaving) =>
           persistBotUpdate(botId, patch, signal, api, desktopApprovalBridge(), currentBot, leaving),
         reconcile: async (botId, signal) => {
-          const result: { bots: BotAnnouncement[] } = await api(`/api/bots?messages=${MESSAGE_PAGE_SIZE}`, { signal });
-          return result.bots.find((candidate) => candidate.id === botId) ?? null;
+          const result: { bots: BotAnnouncement[] } = await api(ROSTER_PATH, { signal });
+          const found = result.bots.find((candidate) => candidate.id === botId);
+          return found ? withoutTranscript(found) : null;
         },
         onAuthoritative: (bot, optimisticOverlay) => {
           rawDispatch({ type: "botPatched", bot: withTaskWrites({ ...bot, ...optimisticOverlay }) });
@@ -2226,10 +2227,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         // Keep blocking sends while reconciliation fails (it is asked again) or a newer write owns this lane.
         if (taskWrites.get(threadId) === pending) {
           pending.patch = {};
-          retryRequest(() => taskWrites.get(threadId) === pending, () => api(`/api/bots?messages=${MESSAGE_PAGE_SIZE}`).then(({ bots }) => {
-            const bot = taskWrites.get(threadId) === pending ? bots.find((candidate: Bot) => candidate.id === botId) : undefined;
+          retryRequest(() => taskWrites.get(threadId) === pending, () => api<{ bots: Bot[] }>(ROSTER_PATH).then(({ bots }) => {
+            const bot = taskWrites.get(threadId) === pending ? bots.find((candidate) => candidate.id === botId) : undefined;
             if (bot) {
-              rawDispatch({ type: "botPatched", bot: withTaskWrites(bot) });
+              rawDispatch({ type: "botPatched", bot: withTaskWrites(withoutTranscript(bot)) });
               taskWrites.delete(threadId);
             }
           }));
@@ -2930,6 +2931,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     if (bot && state.activeView === "chat" && botOpensTo(bot, showThreads) !== bot.threadId) openBot(dispatch, bot, showThreads);
   }, [state.hydrated, state.bots, state.selectedId, state.activeView, showThreads, dispatch]);
 
+  useOpenThreadTail(state, showThreads, rawDispatch);
+
   useEffect(() => {
     let alive = true;
     type PeripheralKey = "instances" | "config" | "routines" | "webhooks" | "notifications";
@@ -3048,22 +3051,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           if (alive && answer) flushSync(() => rawDispatch({ type: "liveCallLookup", call: answer.call, since, seq }));
         })
         .catch(() => {});
-      const chat = () =>
-        api(`/api/bots?messages=${MESSAGE_PAGE_SIZE}`).then((answer) => snapshotArrays(answer, "bots")).then(({ bots, groups, sections, computerControl, botQueuedMessages }) => {
-          if (!alive) return;
-          rawDispatch({
-            type: "hydrate",
-            bots,
-            groups: groups ?? [],
-            sections: sections ?? [],
-            computerControl: computerControl ?? {},
-            botQueuedMessages,
-            preserveNavigation: selectionRevision.current !== navigationAtStart,
-            navigationSince,
-            taskIdsAtStart,
-            resumeId: readLastConversation() ?? undefined,
-          });
+      const chat = async () => {
+        const resumeId = readLastConversation() ?? undefined;
+        const loaded = await prepareRoster(stateRef.current.selectedId, showThreadsRef.current, resumeId);
+        if (!alive) return;
+        rawDispatch({
+          type: "hydrate",
+          ...loaded,
+          preserveNavigation: selectionRevision.current !== navigationAtStart,
+          navigationSince,
+          taskIdsAtStart,
+          resumeId,
         });
+      };
       const peripherals = peripheralParts.map((part) => ({
         key: part.key,
         load: () => loadPeripheral(part, false),

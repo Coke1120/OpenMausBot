@@ -85,7 +85,7 @@ export function proxyHeadersTimeoutMs(url: string, override?: number): number {
     ?? (PHONE_SECRET_PROVIDE_PATH.test(url) ? PHONE_SECRET_HEADERS_TIMEOUT_MS : HEADERS_TIMEOUT_MS);
 }
 
-const MAX_JSON_BODY_BYTES = 32 * 1024 * 1024;
+export const MAX_JSON_BODY_BYTES = 32 * 1024 * 1024;
 
 /** Bounded: an unbounded read on an unauthenticated route is a
  * memory-exhaustion vector. */

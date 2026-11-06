@@ -13,6 +13,7 @@ import { speakerOf, type PersonName } from "../replies.ts";
 import type { Coordinator } from "../coordinator.ts";
 import type { WorkspaceAccess } from "../enterprise.ts";
 import type { GroupUsageReader } from "../group-thread-usage.ts";
+import { fitRosterPayload } from "../host/message-pages.ts";
 import { readMessage, searchMessagesAsync } from "../message-db.ts";
 import {
   listMessageFolder, messageAttachmentName, messageFileDisposition, messageFileDownloadName, messageFolderEntryName,
@@ -92,7 +93,7 @@ export function createThreadRoutes(deps: ThreadRouteDeps): RouteHandler {
       // tasks stays explicit: clients expect [] where wireBot() would omit the key.
       const shownBots = store.bots.filter((bot) => visible.bot(bot.id));
       const queued = publicBotQueuedMessages();
-      return json(res, 200, {
+      const payload = {
         bots: shownBots.map((bot) => {
           const wired = wireBot(bot);
           // Narrowed first: on a Team Cloud the selected conversation may be someone else's, and its words never go out.
@@ -114,7 +115,9 @@ export function createThreadRoutes(deps: ThreadRouteDeps): RouteHandler {
             return [bot.id, { held: snapshot.held, helpReason: snapshot.helpReason, ...(snapshot.help ? { help: snapshot.help } : {}) }];
           }),
         ),
-      });
+      };
+      // Omitted `messages` is the whole transcript. A numbered page has to fit one companion-buffered response.
+      return json(res, 200, limit === undefined ? payload : fitRosterPayload(payload));
     }
 
     m = path.match(/^\/api\/threads\/([\w-]+)\/messages$/);
